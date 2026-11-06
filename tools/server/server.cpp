@@ -168,50 +168,53 @@ static bool server_prepare_params(common_params & params, server_role_type role_
 
 // the API of every server; a router points the handlers in routes at its proxies before calling this
 static void server_register_routes(server_http_context & ctx_http, server_routes & routes) {
+    auto guarded = [&routes](server_http_context::handler_t handler) {
+        return ex_wrapper(routes.with_mtmd_read_lock(std::move(handler)));
+    };
     ctx_http.get ("/health",                   ex_wrapper(routes.get_health)); // public endpoint (no API key check)
     ctx_http.get ("/v1/health",                ex_wrapper(routes.get_health)); // public endpoint (no API key check)
-    ctx_http.get ("/metrics",                  ex_wrapper(routes.get_metrics));
-    ctx_http.get ("/props",                    ex_wrapper(routes.get_props));
+    ctx_http.get ("/metrics",                  guarded(routes.get_metrics));
+    ctx_http.get ("/props",                    guarded(routes.get_props));
     ctx_http.post("/props",                    ex_wrapper(routes.post_props));
-    ctx_http.get ("/models",                   ex_wrapper(routes.get_models));
-    ctx_http.get ("/v1/models",                ex_wrapper(routes.get_models));
-    ctx_http.post("/completion",               ex_wrapper(routes.post_completions)); // legacy
-    ctx_http.post("/completions",              ex_wrapper(routes.post_completions));
-    ctx_http.post("/v1/completions",           ex_wrapper(routes.post_completions_oai));
-    ctx_http.post("/chat/completions",         ex_wrapper(routes.post_chat_completions));
-    ctx_http.post("/v1/chat/completions",      ex_wrapper(routes.post_chat_completions));
-    ctx_http.post("/v1/chat/completions/control", ex_wrapper(routes.post_control));
-    ctx_http.post("/v1/responses",             ex_wrapper(routes.post_responses_oai));
-    ctx_http.post("/responses",                ex_wrapper(routes.post_responses_oai));
-    ctx_http.post("/v1/audio/transcriptions",  ex_wrapper(routes.post_transcriptions_oai));
-    ctx_http.post("/audio/transcriptions",     ex_wrapper(routes.post_transcriptions_oai));
-    ctx_http.post("/tts",                      ex_wrapper(routes.post_tts));
-    ctx_http.ws  ("/v1/realtime",              routes.ws_realtime);
-    ctx_http.post("/v1/messages",              ex_wrapper(routes.post_anthropic_messages)); // anthropic messages API
-    ctx_http.post("/infill",                   ex_wrapper(routes.post_infill));
-    ctx_http.post("/embedding",                ex_wrapper(routes.post_embeddings)); // legacy
-    ctx_http.post("/embeddings",               ex_wrapper(routes.post_embeddings));
-    ctx_http.post("/v1/embeddings",            ex_wrapper(routes.post_embeddings_oai));
-    ctx_http.post("/rerank",                   ex_wrapper(routes.post_rerank));
-    ctx_http.post("/reranking",                ex_wrapper(routes.post_rerank));
-    ctx_http.post("/v1/rerank",                ex_wrapper(routes.post_rerank));
-    ctx_http.post("/v1/reranking",             ex_wrapper(routes.post_rerank));
-    ctx_http.post("/v1/systemone",             ex_wrapper(routes.post_systemone));
-    ctx_http.post("/tokenize",                 ex_wrapper(routes.post_tokenize));
-    ctx_http.post("/detokenize",               ex_wrapper(routes.post_detokenize));
-    ctx_http.post("/apply-template",           ex_wrapper(routes.post_apply_template));
+    ctx_http.get ("/models",                   guarded(routes.get_models));
+    ctx_http.get ("/v1/models",                guarded(routes.get_models));
+    ctx_http.post("/completion",               guarded(routes.post_completions)); // legacy
+    ctx_http.post("/completions",              guarded(routes.post_completions));
+    ctx_http.post("/v1/completions",           guarded(routes.post_completions_oai));
+    ctx_http.post("/chat/completions",         guarded(routes.post_chat_completions));
+    ctx_http.post("/v1/chat/completions",      guarded(routes.post_chat_completions));
+    ctx_http.post("/v1/chat/completions/control", guarded(routes.post_control));
+    ctx_http.post("/v1/responses",             guarded(routes.post_responses_oai));
+    ctx_http.post("/responses",                guarded(routes.post_responses_oai));
+    ctx_http.post("/v1/audio/transcriptions",  guarded(routes.post_transcriptions_oai));
+    ctx_http.post("/audio/transcriptions",     guarded(routes.post_transcriptions_oai));
+    ctx_http.post("/tts",                      guarded(routes.post_tts));
+    ctx_http.ws  ("/v1/realtime",              routes.with_mtmd_read_lock(routes.ws_realtime));
+    ctx_http.post("/v1/messages",              guarded(routes.post_anthropic_messages)); // anthropic messages API
+    ctx_http.post("/infill",                   guarded(routes.post_infill));
+    ctx_http.post("/embedding",                guarded(routes.post_embeddings)); // legacy
+    ctx_http.post("/embeddings",               guarded(routes.post_embeddings));
+    ctx_http.post("/v1/embeddings",            guarded(routes.post_embeddings_oai));
+    ctx_http.post("/rerank",                   guarded(routes.post_rerank));
+    ctx_http.post("/reranking",                guarded(routes.post_rerank));
+    ctx_http.post("/v1/rerank",                guarded(routes.post_rerank));
+    ctx_http.post("/v1/reranking",             guarded(routes.post_rerank));
+    ctx_http.post("/v1/systemone",             guarded(routes.post_systemone));
+    ctx_http.post("/tokenize",                 guarded(routes.post_tokenize));
+    ctx_http.post("/detokenize",               guarded(routes.post_detokenize));
+    ctx_http.post("/apply-template",           guarded(routes.post_apply_template));
     // token counting
-    ctx_http.post("/chat/completions/input_tokens",    ex_wrapper(routes.post_chat_completions_tok));
-    ctx_http.post("/v1/chat/completions/input_tokens", ex_wrapper(routes.post_chat_completions_tok));
-    ctx_http.post("/responses/input_tokens",           ex_wrapper(routes.post_responses_tok_oai));
-    ctx_http.post("/v1/responses/input_tokens",        ex_wrapper(routes.post_responses_tok_oai));
-    ctx_http.post("/v1/messages/count_tokens",         ex_wrapper(routes.post_anthropic_count_tokens)); // anthropic token counting
+    ctx_http.post("/chat/completions/input_tokens",    guarded(routes.post_chat_completions_tok));
+    ctx_http.post("/v1/chat/completions/input_tokens", guarded(routes.post_chat_completions_tok));
+    ctx_http.post("/responses/input_tokens",           guarded(routes.post_responses_tok_oai));
+    ctx_http.post("/v1/responses/input_tokens",        guarded(routes.post_responses_tok_oai));
+    ctx_http.post("/v1/messages/count_tokens",         guarded(routes.post_anthropic_count_tokens)); // anthropic token counting
     // LoRA adapters hotswap
-    ctx_http.get ("/lora-adapters",            ex_wrapper(routes.get_lora_adapters));
-    ctx_http.post("/lora-adapters",            ex_wrapper(routes.post_lora_adapters));
+    ctx_http.get ("/lora-adapters",            guarded(routes.get_lora_adapters));
+    ctx_http.post("/lora-adapters",            guarded(routes.post_lora_adapters));
     // Save & load slots
-    ctx_http.get ("/slots",                    ex_wrapper(routes.get_slots));
-    ctx_http.post("/slots/:id_slot",           ex_wrapper(routes.post_slots));
+    ctx_http.get ("/slots",                    guarded(routes.get_slots));
+    ctx_http.post("/slots/:id_slot",           guarded(routes.post_slots));
 
     // Google Cloud Platform (Vertex AI) compat
     ctx_http.register_gcp_compat();

@@ -32,6 +32,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
     SERVER_TASK_TYPE_TTS,
+    SERVER_TASK_TYPE_SET_VISION,
 };
 
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
@@ -243,6 +244,9 @@ struct server_task {
 
     // used by SERVER_TASK_TYPE_TTS
     mtmd_helper::gen_audio::inp tts_inp;
+
+    // used by SERVER_TASK_TYPE_SET_VISION
+    std::string vision_mmproj_path;
 
     server_task() = default;
 
@@ -605,6 +609,12 @@ struct server_task_result_error : server_task_result {
     virtual bool is_error() override {
         return true;
     }
+
+    virtual json to_json() override;
+};
+
+struct server_task_result_vision : server_task_result {
+    bool active = false;
 
     virtual json to_json() override;
 };

@@ -1552,6 +1552,16 @@ json server_task_result_error::to_json() {
     return res;
 }
 
+json server_task_result_vision::to_json() {
+    return {
+        {"success", true},
+        {"vision", {
+            {"enabled", active},
+            {"active",  active},
+        }},
+    };
+}
+
 //
 // server_task_result_metrics
 //

@@ -10,6 +10,7 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#include <shared_mutex>
 
 struct server_context_impl; // private implementation
 
@@ -100,6 +101,9 @@ struct server_routes {
     server_routes(const common_params & params, server_context & ctx_server);
 
     void init_routes();
+
+    server_http_context::handler_t with_mtmd_read_lock(server_http_context::handler_t handler);
+    server_http_context::ws_handler_t with_mtmd_read_lock(server_http_context::ws_handler_t handler);
 
     // note: this is not thread-safe and can only when ctx_http.is_ready is false
     void update_meta(const server_context & ctx_server) {
