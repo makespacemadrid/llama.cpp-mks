@@ -30,6 +30,7 @@
 #include <memory>
 #include <filesystem>
 #include <random>
+#include <shared_mutex>
 #include <utility>
 #include <fstream>
 
@@ -1012,6 +1013,7 @@ public:
     llama_model * model_tgt = nullptr;
 
     mtmd_context * mctx = nullptr;
+    std::shared_mutex mutex_mtmd;
     // note: video_params.ffmpeg_bin_dir points into params_base, which outlives this struct
     mtmd_helper_init_opt init_opt = mtmd_helper_init_opt_default();
     const llama_vocab * vocab = nullptr;
@@ -1052,6 +1054,71 @@ public:
 
     void reset_metrics_bucket() {
         metrics.reset_bucket();
+    }
+
+    bool activate_vision(const std::string & mmproj_path, std::string & error) {
+        if (mctx != nullptr) {
+            return true;
+        }
+
+        mtmd_context_params mparams = mtmd_context_params_default();
+        mparams.use_gpu          = params_base.mmproj_use_gpu;
+        mparams.device           = params_base.mmproj_device;
+        mparams.print_timings    = false;
+        mparams.n_threads        = params_base.cpuparams.n_threads;
+        mparams.flash_attn_type  = params_base.flash_attn_type;
+        mparams.warmup           = params_base.warmup;
+        mparams.image_min_tokens = params_base.image_min_tokens;
+        mparams.image_max_tokens = params_base.image_max_tokens;
+        mparams.batch_max_tokens = params_base.mtmd_batch_max_tokens;
+        mparams.media_marker     = get_media_marker();
+
+        const mtmd_memory_usage usage = mtmd_get_memory_usage(mmproj_path.c_str(), mparams);
+        const int n_ubatch = llama_n_ubatch(ctx_tgt);
+        const bool is_mixed = use_mixed_batch();
+        if (is_mixed || usage.use_non_causal) {
+            const int n_max = is_mixed ? n_ubatch / 2 : n_ubatch;
+            if (usage.image_max_tokens > n_max) {
+                SRV_WRN("cap image_max_tokens (original=%d) to %d for on-demand vision\n", usage.image_max_tokens, n_max);
+                mparams.image_max_tokens = n_max;
+                mparams.image_min_tokens = std::min(mparams.image_min_tokens, n_max);
+            }
+        }
+
+        mtmd_context * next = mtmd_init_from_file(mmproj_path.c_str(), model_tgt, mparams);
+        if (next == nullptr) {
+            error = string_format("failed to load multimodal model, '%s'", mmproj_path.c_str());
+            return false;
+        }
+
+        params_base.mmproj.path = mmproj_path;
+        init_opt.video_params.fps_target = params_base.video_fps;
+        init_opt.video_params.timestamp_interval_ms = params_base.video_timestamp_interval_ms;
+        init_opt.video_params.ffmpeg_bin_dir = params_base.video_ffmpeg_bin_dir.empty()
+                            ? nullptr : params_base.video_ffmpeg_bin_dir.c_str();
+        if (params_base.ctx_shift) {
+            params_base.ctx_shift = false;
+            SRV_WRN("%s\n", "ctx_shift is not supported by multimodal, it will be disabled");
+        }
+        if (params_base.n_cache_reuse) {
+            params_base.n_cache_reuse = 0;
+            SRV_WRN("%s\n", "cache_reuse is not supported by multimodal, it will be disabled");
+        }
+        mctx = next;
+        chat_params.allow_image = mtmd_support_vision(mctx);
+        chat_params.allow_audio = mtmd_support_audio(mctx);
+        chat_params.allow_video = mtmd_helper_support_video(mctx);
+
+        for (auto & slot : slots) {
+            slot.mctx = mctx;
+            slot.prompt.tokens.has_mtmd = true;
+            if (has_cap_tts()) {
+                slot.tts.ctx.init(ctx_tgt, mctx);
+            }
+        }
+
+        SRV_INF("loaded multimodal model on demand, '%s'\n", mmproj_path.c_str());
+        return true;
     }
 
 private:
@@ -3026,6 +3093,37 @@ private:
                             }
                         }
                     }
+                } break;
+            case SERVER_TASK_TYPE_SET_VISION:
+                {
+                    bool has_active_slot = false;
+                    for (const auto & slot : slots) {
+                        if (slot.is_processing()) {
+                            has_active_slot = true;
+                            break;
+                        }
+                    }
+                    if (has_active_slot) {
+                        send_error(task, "cannot activate vision while slots are active", ERROR_TYPE_UNAVAILABLE);
+                        break;
+                    }
+                    if (mctx != nullptr) {
+                        auto res = std::make_unique<server_task_result_vision>();
+                        res->id = task.id;
+                        res->active = true;
+                        queue_results.send(std::move(res));
+                        break;
+                    }
+
+                    std::string error;
+                    if (!activate_vision(task.vision_mmproj_path, error)) {
+                        send_error(task, error, ERROR_TYPE_SERVER);
+                        break;
+                    }
+                    auto res = std::make_unique<server_task_result_vision>();
+                    res->id = task.id;
+                    res->active = true;
+                    queue_results.send(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_CANCEL:
                 {
@@ -5483,6 +5581,22 @@ server_routes::server_routes(const common_params & params, server_context & ctx_
     });
 }
 
+server_http_context::handler_t server_routes::with_mtmd_read_lock(server_http_context::handler_t handler) {
+    return [this, handler = std::move(handler)](const server_http_req & req) {
+        std::shared_lock<std::shared_mutex> lock(ctx_server.mutex_mtmd);
+        return handler(req);
+    };
+}
+
+server_http_context::ws_handler_t server_routes::with_mtmd_read_lock(
+        server_http_context::ws_handler_t handler) {
+    return [this, handler = std::move(handler)](
+            const server_http_req & req, server_http_context::ws_conn & conn) {
+        std::shared_lock<std::shared_mutex> lock(ctx_server.mutex_mtmd);
+        handler(req, conn);
+    };
+}
+
 static json get_res_model_info(const server_context_meta & meta) {
     // note: do NOT use ctx_server here, otherwise it's not possible to use this during sleep
 
@@ -5492,9 +5606,9 @@ static json get_res_model_info(const server_context_meta & meta) {
         {"tags",     meta.model_tags},
         {"object",   "model"},
         {"architecture", server_model_architecture_json(
-            meta.has_inp_image,
-            meta.has_inp_audio,
-            meta.has_inp_video,
+            meta.chat_params.allow_image,
+            meta.chat_params.allow_audio,
+            meta.chat_params.allow_video,
             meta.model_output_modalities)},
         {"created",  std::time(0)},
         {"owned_by", "llamacpp"},
@@ -5525,7 +5639,8 @@ static json get_res_models(const server_context_meta & meta) {
                 {"type", "model"},
                 {"description", ""},
                 {"tags", json::array({""})},
-                {"capabilities", meta.has_mtmd ? json::array({"completion","multimodal"}) : json::array({"completion"})},
+                {"capabilities", (meta.chat_params.allow_image || meta.chat_params.allow_audio || meta.chat_params.allow_video)
+                    ? json::array({"completion","multimodal"}) : json::array({"completion"})},
                 {"parameters", ""},
                 {"details", {
                     {"parent_model", ""},
@@ -5564,9 +5679,9 @@ static json get_res_props(const server_context_meta & meta, const common_params 
         { "model_ftype",                 meta.model_ftype },
         { "model_path",                  meta.model_path },
         { "modalities",                  json {
-            {"vision", meta.has_inp_image},
-            {"video",  meta.has_inp_video},
-            {"audio",  meta.has_inp_audio},
+            {"vision", meta.chat_params.allow_image},
+            {"video",  meta.chat_params.allow_video},
+            {"audio",  meta.chat_params.allow_audio},
         } },
         { "media_marker",                get_media_marker() },
         { "endpoint_slots",              params.endpoint_slots },
@@ -5765,15 +5880,49 @@ void server_routes::init_routes() {
         return res;
     };
 
-    this->post_props = [this](const server_http_req &) {
+    this->post_props = [this](const server_http_req & req) {
         auto res = create_response();
         if (!params.endpoint_props) {
             res->error(format_error_response("This server does not support changing global properties. Start it with `--props`", ERROR_TYPE_NOT_SUPPORTED));
             return res;
         }
-        // update any props here
 
-        res->ok({{ "success", true }});
+        const json body = json::parse(req.body);
+        if (!body.contains("vision")) {
+            res->ok({{ "success", true }});
+            return res;
+        }
+        const json & vision = body.at("vision");
+        if (!vision.is_object() || !vision.contains("enabled") || !vision.at("enabled").is_boolean()) {
+            res->error(format_error_response("vision.enabled must be a boolean", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        if (!vision.at("enabled").get<bool>()) {
+            res->error(format_error_response("unloading vision at runtime is not supported", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+        if (!vision.contains("mmproj") || !vision.at("mmproj").is_string() || vision.at("mmproj").get<std::string>().empty()) {
+            res->error(format_error_response("vision.mmproj must be a non-empty string", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        std::unique_lock<std::shared_mutex> lock(ctx_server.mutex_mtmd);
+        server_task task(SERVER_TASK_TYPE_SET_VISION);
+        task.id = res->rd.get_new_id();
+        task.vision_mmproj_path = vision.at("mmproj").get<std::string>();
+        res->rd.post_task(std::move(task), true);
+
+        auto result = res->rd.next(req.should_stop);
+        if (!result) {
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+        auto * vision_result = dynamic_cast<server_task_result_vision *>(result.get());
+        GGML_ASSERT(vision_result != nullptr);
+        res->ok(vision_result->to_json());
         return res;
     };
 
@@ -5969,7 +6118,7 @@ void server_routes::init_routes() {
     this->post_transcriptions_oai = [this](const server_http_req & req) {
         auto res = create_response();
 
-        if (!meta->has_mtmd || !meta->chat_params.allow_audio) {
+        if (!meta->chat_params.allow_audio) {
             res->error(format_error_response("The current model does not support audio input.", ERROR_TYPE_NOT_SUPPORTED));
             return res;
         }
@@ -6491,7 +6640,7 @@ void server_routes::init_routes() {
 
         std::vector<raw_buffer> files;
         const json state = decision.prepare_state(decision.parse_state(body, files));
-        if (!files.empty() && (!decision.can_use_images() || !meta->has_inp_image)) {
+        if (!files.empty() && (!decision.can_use_images() || !meta->chat_params.allow_image)) {
             res->error(format_error_response("This server does not support image input for decisions. For a model that supports it, start it with `--mmproj`", ERROR_TYPE_NOT_SUPPORTED));
             return res;
         }

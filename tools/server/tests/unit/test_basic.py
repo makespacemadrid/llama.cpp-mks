@@ -63,6 +63,19 @@ def test_server_props():
     assert default_val["params"]["seed"] == server.seed
 
 
+def test_server_props_validates_hot_vision_request():
+    global server
+    server.server_props = True
+    server.start()
+
+    res = server.make_request("POST", "/props", data={"vision": {"enabled": True}})
+    assert res.status_code == 400
+    assert "vision.mmproj" in res.body["error"]["message"]
+
+    res = server.make_request("POST", "/props", data={"vision": {"enabled": False}})
+    assert res.status_code == 501
+
+
 def test_server_models():
     global server
     server.start()
