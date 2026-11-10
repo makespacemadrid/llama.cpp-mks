@@ -1552,6 +1552,20 @@ json server_task_result_error::to_json() {
     return res;
 }
 
+json server_task_result_context::to_json() {
+    return {
+        {"success", true},
+        {"context", {
+            {"n_ctx",      n_ctx},
+            {"n_ctx_slot", n_ctx_slot},
+            {"n_parallel", n_parallel},
+            {"n_ubatch",   n_ubatch},
+            {"n_batch",    n_batch},
+            {"t_ms",       t_ms},
+        }},
+    };
+}
+
 json server_task_result_vision::to_json() {
     return {
         {"success", true},

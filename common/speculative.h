@@ -115,6 +115,14 @@ struct common_speculative_init_result {
     llama_model   * model();
     llama_context * context();
 
+    // free the draft context, keeping a draft model loaded; it points at the
+    // target context (ctx_other), so it has to go before the target is freed
+    void free_context();
+
+    // create the draft context again against a new target context, reusing a
+    // loaded draft model instead of reading its weights from disk
+    bool recreate_context(common_params & params, llama_model * model_tgt, llama_context * ctx_tgt);
+
 private:
     struct impl;
     std::unique_ptr<impl> pimpl;

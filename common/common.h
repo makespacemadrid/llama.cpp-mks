@@ -1004,7 +1004,13 @@ struct common_init_result {
 
     std::vector<llama_adapter_lora_ptr> & lora();
 
+    // free the context and create a new one from params, keeping the model
+    // loaded; returns false (and leaves no context) if the new one cannot be created
+    bool recreate_context(common_params & params);
+
 private:
+    llama_context * create_context(common_params & params, llama_context_params cparams);
+
     struct impl;
     std::unique_ptr<impl> pimpl;
 };
@@ -1042,6 +1048,10 @@ struct common_threadpools {
     common_threadpools & operator=(const common_threadpools &) = delete;
 
     void init(llama_context * ctx, const common_params & params);
+
+    // free the pools so init() can run again for a new context; the context
+    // that used them must already have been freed
+    void reset();
 
 private:
     ggml_threadpool * threadpool       = nullptr;

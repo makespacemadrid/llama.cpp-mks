@@ -1273,26 +1273,9 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
         params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
 }
 
-common_init_result::common_init_result(common_params & params, bool model_only) :
-    pimpl(new impl{}) {
-    auto mparams = common_model_params_to_llama(params);
-    auto cparams = common_context_params_to_llama(params);
-
-    common_fit_apply(params, mparams, cparams);
-
-    llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
-    if (model == NULL) {
-        return;
-    }
-
-    pimpl->model.reset(model);
-
-    if (model_only) {
-        return;
-    }
-
-    const llama_vocab * vocab = llama_model_get_vocab(model);
-
+// context-level adjustments that depend on the loaded model, shared by the first
+// load and by common_init_result::recreate_context
+static void common_adjust_context_params(llama_model * model, common_params & params, llama_context_params & cparams) {
     // these decision models return a score for each token via the embeddings output
     // TODO: maybe improve this in the future
     const auto decision_type = common_get_decision_type(model);
@@ -1326,6 +1309,29 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         cparams.n_batch = cparams.n_ubatch;
         params.n_batch  = params.n_ubatch;
     }
+}
+
+common_init_result::common_init_result(common_params & params, bool model_only) :
+    pimpl(new impl{}) {
+    auto mparams = common_model_params_to_llama(params);
+    auto cparams = common_context_params_to_llama(params);
+
+    common_fit_apply(params, mparams, cparams);
+
+    llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
+    if (model == NULL) {
+        return;
+    }
+
+    pimpl->model.reset(model);
+
+    if (model_only) {
+        return;
+    }
+
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+
+    common_adjust_context_params(model, params, cparams);
 
     // load and optionally apply lora adapters
     for (auto & la : params.lora_adapters) {
@@ -1369,7 +1375,21 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
                 params.sampling.logit_bias_eog.begin(), params.sampling.logit_bias_eog.end());
     }
 
+    // before the context, as before: its threadpools inherit the priority
+    set_process_priority(params.cpuparams.priority);
+
+    if (create_context(params, cparams) == nullptr) {
+        COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
+        return;
+    }
+}
+
+llama_context * common_init_result::create_context(common_params & params, llama_context_params cparams) {
+    llama_model * model = pimpl->model.get();
+
     // init the backend samplers as part of the context creation
+    pimpl->samplers.clear();
+    pimpl->samplers_seq_config.clear();
     pimpl->samplers.resize(cparams.n_seq_max);
     pimpl->samplers_seq_config.resize(cparams.n_seq_max);
 
@@ -1385,15 +1405,44 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
     llama_context * lctx = llama_init_from_model(model, cparams);
     if (lctx == NULL) {
-        COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
-        return;
+        return nullptr;
     }
 
     pimpl->context.reset(lctx);
-
-    set_process_priority(params.cpuparams.priority);
-
     pimpl->threadpools.init(lctx, params);
+
+    return lctx;
+}
+
+bool common_init_result::recreate_context(common_params & params) {
+    llama_model * model = pimpl->model.get();
+    if (model == nullptr) {
+        return false;
+    }
+
+    // free the old context first: the new one usually only fits once the old
+    // KV cache and compute buffers have been given back
+    pimpl->context.reset();
+    pimpl->threadpools.reset();
+    pimpl->samplers.clear();
+    pimpl->samplers_seq_config.clear();
+
+    auto cparams = common_context_params_to_llama(params);
+    common_adjust_context_params(model, params, cparams);
+
+    llama_context * lctx = create_context(params, cparams);
+    if (lctx == nullptr) {
+        COM_ERR("failed to recreate context (n_ctx = %u, n_seq_max = %u, n_ubatch = %u)\n",
+                cparams.n_ctx, cparams.n_seq_max, cparams.n_ubatch);
+        return false;
+    }
+
+    // adapters attached to the context have to be applied again
+    if (!params.lora_init_without_apply) {
+        common_set_adapter_lora(lctx, params.lora_adapters);
+    }
+
+    return true;
 }
 
 llama_model * common_init_result::model() {
@@ -1785,11 +1834,17 @@ struct ggml_threadpool_params ggml_threadpool_params_from_cpu_params(const commo
 }
 
 common_threadpools::~common_threadpools() {
+    reset();
+}
+
+void common_threadpools::reset() {
     if (!free_fn) {
         return;
     }
     free_fn(threadpool);
     free_fn(threadpool_batch);
+    threadpool       = nullptr;
+    threadpool_batch = nullptr;
 }
 
 void common_threadpools::init(llama_context * ctx, const common_params & params) {

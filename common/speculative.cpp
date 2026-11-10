@@ -2828,20 +2828,17 @@ struct common_speculative_init_result::impl {
     llama_context_ptr context;
 };
 
-common_speculative_init_result::common_speculative_init_result(
-    common_params & params,
-      llama_model * model_tgt,
-    llama_context * ctx_tgt) :
-    pimpl(new impl{}) {
-    const bool has_draft = params.speculative.has_dft();
-    const bool spec_mtp = std::find(params.speculative.types.begin(),
-                                    params.speculative.types.end(),
-                                    COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+static bool common_speculative_is_mtp(const common_params & params) {
+    return std::find(params.speculative.types.begin(),
+                     params.speculative.types.end(),
+                     COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+}
 
-    auto mparams = common_model_params_to_llama(params);
+// context parameters of the draft / MTP context for a given target context
+static llama_context_params common_speculative_draft_cparams(const common_params & params, llama_context * ctx_tgt) {
     auto cparams = common_context_params_to_llama(params);
 
-    if (spec_mtp) {
+    if (common_speculative_is_mtp(params)) {
         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
     }
 
@@ -2852,6 +2849,20 @@ common_speculative_init_result::common_speculative_init_result(
     //       the extra memory for small models is likely negligible?
     cparams.n_rs_seq  = 0;
     cparams.ctx_other = ctx_tgt;
+
+    return cparams;
+}
+
+common_speculative_init_result::common_speculative_init_result(
+    common_params & params,
+      llama_model * model_tgt,
+    llama_context * ctx_tgt) :
+    pimpl(new impl{}) {
+    const bool has_draft = params.speculative.has_dft();
+    const bool spec_mtp  = common_speculative_is_mtp(params);
+
+    auto mparams = common_model_params_to_llama(params);
+    auto cparams = common_speculative_draft_cparams(params, ctx_tgt);
 
     std::string model_path;
     if (has_draft) {
@@ -2889,6 +2900,29 @@ common_speculative_init_result::common_speculative_init_result(
 }
 
 common_speculative_init_result::~common_speculative_init_result() = default;
+
+void common_speculative_init_result::free_context() {
+    pimpl->context.reset();
+}
+
+bool common_speculative_init_result::recreate_context(common_params & params, llama_model * model_tgt, llama_context * ctx_tgt) {
+    pimpl->context.reset();
+
+    // a separate draft model, or the target itself for MTP heads
+    llama_model * model = pimpl->model ? pimpl->model.get() : model_tgt;
+    if (model == nullptr) {
+        return false;
+    }
+
+    llama_context * ctx_dft = llama_init_from_model(model, common_speculative_draft_cparams(params, ctx_tgt));
+    if (ctx_dft == nullptr) {
+        LOG_ERR("%s: failed to recreate the draft context\n", __func__);
+        return false;
+    }
+
+    pimpl->context.reset(ctx_dft);
+    return true;
+}
 
 llama_model * common_speculative_init_result::model() {
     return pimpl->model.get();
