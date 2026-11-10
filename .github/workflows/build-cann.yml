@@ -22,6 +22,7 @@ on:
       'ggml/src/ggml-cann/**'
     ]
 
+cache-mode: none
 permissions:
   contents: read
 
